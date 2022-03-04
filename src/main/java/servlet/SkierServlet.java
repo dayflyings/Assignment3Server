@@ -21,6 +21,31 @@ import java.util.concurrent.TimeoutException;
 @WebServlet(name = "SkierServlet", urlPatterns = "/skiers/*")
 public class SkierServlet extends HttpServlet {
     private Gson gson = new Gson();
+    private static Connection connection = null;
+    private final ThreadLocal<Channel> channels = new ThreadLocal<>();
+    @Override
+    public void init() throws ServletException {
+        super.init();
+        ConnectionFactory factory = new ConnectionFactory();
+        factory.setHost("172.31.87.118");
+        factory.setUsername("test");
+        factory.setPassword("test");
+        try {
+            connection = factory.newConnection();
+        } catch (IOException | TimeoutException e) {
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void destroy() {
+        super.destroy();
+        try {
+            connection.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
 
     @Override
     protected void doGet(HttpServletRequest request, HttpServletResponse response) throws ServletException, IOException {
@@ -94,9 +119,11 @@ public class SkierServlet extends HttpServlet {
             int resortIdPosition = 1;
             int seasonIdPosition = 3;
             int dayIdPosition = 5;
+            int skierIdPosition = 7;
             int resortId = Integer.parseInt(urlParts[resortIdPosition]);
             int seasonId = Integer.parseInt(urlParts[seasonIdPosition]);
             int dayId = Integer.parseInt(urlParts[dayIdPosition]);
+            int skierId = Integer.parseInt(urlParts[skierIdPosition]);
             if ((resortId != 1 && resortId != 2) ||
                     (seasonId != 2017 && seasonId != 2018) ||
                     (dayId < 1 || dayId > 365)) {
@@ -109,22 +136,24 @@ public class SkierServlet extends HttpServlet {
                     sb.append(line + "\n");
                 }
                 response.setStatus(HttpServletResponse.SC_CREATED);
-                sendMessage();
+                sendMessageToQueue(resortId, seasonId, dayId, skierId);
                 out.write("Write successful:" + sb);
             }
         }
     }
 
-    private void sendMessage() {
-        ConnectionFactory factory = new ConnectionFactory();
-        factory.setHost("localhost");
-        try (Connection connection = factory.newConnection();
-             Channel channel = connection.createChannel()) {
+    private void sendMessageToQueue(int resortId, int seasonId, int dayId, int skierId) {
+        try  {
+            Channel channel = channels.get();
+            if (channel == null) {
+                channel = connection.createChannel();
+                channels.set(channel);
+            }
             channel.queueDeclare("Hello", false, false, false, null);
-            String message = "Hello World!";
+            String message = resortId + "\n" + seasonId + "\n" + dayId + "\n" + skierId;
             channel.basicPublish("", "Hello", null, message.getBytes());
             System.out.println(" [x] Sent '" + message + "'");
-        } catch (IOException | TimeoutException e) {
+        } catch (IOException e) {
             e.printStackTrace();
         }
     }
