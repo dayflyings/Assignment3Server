@@ -4,6 +4,10 @@ import com.google.gson.Gson;
 import com.rabbitmq.client.Channel;
 import com.rabbitmq.client.Connection;
 import com.rabbitmq.client.ConnectionFactory;
+import org.apache.commons.lang3.concurrent.EventCountCircuitBreaker;
+import org.apache.commons.pool2.ObjectPool;
+import org.apache.commons.pool2.impl.GenericObjectPool;
+import util.ChannelFactory;
 import util.Tools;
 
 import javax.servlet.ServletException;
@@ -16,13 +20,14 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 @WebServlet(name = "SkierServlet", urlPatterns = "/skiers/*")
 public class SkierServlet extends HttpServlet {
     private Gson gson = new Gson();
     private static Connection connection = null;
-    private final ThreadLocal<Channel> channels = new ThreadLocal<>();
+    private ObjectPool<Channel> pool;
     @Override
     public void init() throws ServletException {
         super.init();
@@ -32,6 +37,7 @@ public class SkierServlet extends HttpServlet {
         factory.setPassword("test");
         try {
             connection = factory.newConnection();
+            pool = new GenericObjectPool<>(new ChannelFactory(connection));
         } catch (IOException | TimeoutException e) {
             e.printStackTrace();
         }
@@ -105,12 +111,12 @@ public class SkierServlet extends HttpServlet {
         BufferedReader reader = request.getReader();
         PrintWriter out = response.getWriter();
         String urlPath = request.getPathInfo();
-
+        EventCountCircuitBreaker breaker =
+                new EventCountCircuitBreaker(500, 1, TimeUnit.SECONDS, 300);
         if (urlPath == null || urlPath.isEmpty()) {
             response.setStatus(HttpServletResponse.SC_NOT_FOUND);
             response.getWriter().write("missing paramterers");
         }
-
         String[] urlParts = urlPath.split("/");
         if (!Tools.isUrlValid(urlParts)) {
             response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
@@ -133,28 +139,57 @@ public class SkierServlet extends HttpServlet {
                 StringBuilder sb = new StringBuilder();
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    sb.append(line + "\n");
+                    sb.append(line);
                 }
-                response.setStatus(HttpServletResponse.SC_CREATED);
-                sendMessageToQueue(resortId, seasonId, dayId, skierId);
-                out.write("Write successful:" + sb);
+                reader.close();
+                String[] resList = sb.toString().split(",");
+                if (resList.length == 3) {
+                    int time = Integer.parseInt(resList[0]);
+                    int liftId = Integer.parseInt(resList[1]);
+                    int waitTime = Integer.parseInt(resList[2]);
+                    if (breaker.incrementAndCheckState()) {
+                        response.setStatus(HttpServletResponse.SC_CREATED);
+                        sendMessageToQueue(resortId, seasonId, dayId, skierId, time, liftId, waitTime);
+                        out.write("Write successful: \n" + sb);
+                    } else {
+                        response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+                        out.write("Sever busy.");
+                    }
+                } else {
+                    response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+                    out.write("Missing body");
+                }
             }
         }
     }
 
-    private void sendMessageToQueue(int resortId, int seasonId, int dayId, int skierId) {
-        try  {
-            Channel channel = channels.get();
-            if (channel == null) {
-                channel = connection.createChannel();
-                channels.set(channel);
+    private void sendMessageToQueue(int resortId, int seasonId, int dayId, int skierId, int time, int liftId, int waitTime) {
+        Channel channel = null;
+        try {
+            if (connection == null) {
+                ConnectionFactory factory = new ConnectionFactory();
+                factory.setHost("172.31.87.118");
+                factory.setUsername("test");
+                factory.setPassword("test");
+                connection = factory.newConnection();
+                pool = new GenericObjectPool<>(new ChannelFactory(connection));
             }
+            channel = pool.borrowObject();
             channel.queueDeclare("Hello", false, false, false, null);
-            String message = resortId + "\n" + seasonId + "\n" + dayId + "\n" + skierId;
+            channel.queueDeclare("Resort", false, false, false, null);
+            String message = resortId + "\n" + seasonId + "\n" + dayId + "\n" + skierId + "\n" + time + "\n" + liftId + "\n" + waitTime;
             channel.basicPublish("", "Hello", null, message.getBytes());
+            channel.basicPublish("", "Resort", null, message.getBytes());
             System.out.println(" [x] Sent '" + message + "'");
-        } catch (IOException e) {
+        } catch (Exception e) {
             e.printStackTrace();
+        } finally {
+            try {
+                if (channel != null) {
+                    pool.returnObject(channel);
+                }
+            } catch (Exception ignored) {
+            }
         }
     }
 }
